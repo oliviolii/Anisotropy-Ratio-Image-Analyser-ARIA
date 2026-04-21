@@ -1,3 +1,5 @@
+#Utilization of the cellpose made by Stringer, C., Wang, T., Michaelos, M., & Pachitariu, M. (2021). Cellpose: a generalist algorithm for cellular segmentation. Nature methods, 18(1), 100-106.
+
 import argparse
 import os
 from cellpose import models, io  # Import the io module for save_rois
