@@ -478,10 +478,16 @@ public class AR_IA implements PlugIn {
 
             for (int f = 1; f <= frames; f++) {
 
-                IJ.showProgress(f, frames);
+    IJ.showProgress(f, frames);
 
-                float[] pixels1 = (float[]) stack1.getProcessor(f).getPixels();
-                float[] pixels2 = (float[]) stack2.getProcessor(f).getPixels();
+    ImageProcessor ip1raw = stack1.getProcessor(f);
+    ImageProcessor ip2raw = stack2.getProcessor(f);
+
+    FloatProcessor fp1 = (ip1raw instanceof FloatProcessor) ? (FloatProcessor) ip1raw : ip1raw.convertToFloatProcessor();
+    FloatProcessor fp2 = (ip2raw instanceof FloatProcessor) ? (FloatProcessor) ip2raw : ip2raw.convertToFloatProcessor();
+
+    float[] pixels1 = (float[]) fp1.getPixels();
+    float[] pixels2 = (float[]) fp2.getPixels();
 
                 int pixelCount = pixels1.length;
 
