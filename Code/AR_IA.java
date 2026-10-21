@@ -1,6 +1,16 @@
 
 
 import ij.IJ;
+import ij.io.RoiDecoder;
+import ij.io.RoiEncoder;
+import ij.plugin.ChannelSplitter;
+import ij.process.StackStatistics;
+import java.io.ByteArrayOutputStream;
+import java.util.HashSet;
+import java.util.Locale;
+import java.util.Set;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 import ij.plugin.PlugIn;
 import ij.plugin.RoiEnlarger;
 import ij.plugin.filter.RankFilters;
@@ -98,7 +108,7 @@ public class AR_IA implements PlugIn {
     private static float brightnessMultiplier = 1.0f;
     private static float brightnessExponent = 1.0f;
     private static float maxHistoValue = 0.2f;
-    private String sampleName = "";
+    private static String sampleName = "";
     private JTextField sampleNameField;   // IMPORTANT: also global
     private static String savePath;
     private static String inputCellpose;
@@ -149,6 +159,131 @@ public class AR_IA implements PlugIn {
    private static double bgParallel = 0;
    private static double bgPerpendicular = 0;
    private static double fCorr = 1;
+
+    // =====================================================================
+    //  REMEMBERED DIALOG SETTINGS
+    //  Everything below is static, so it is kept for as long as Fiji stays
+    //  open (also when the plugin window is closed and reopened) and is
+    //  forgotten when Fiji is closed.
+    // =====================================================================
+    // Last selected image per dropdown (key = dialog/field id, value = image title)
+    private static final Map<String, String> lastImageChoice = new HashMap<>();
+
+    // "get value of each pixel of one frame"
+    private static double ppBgOne = 0.0;
+    private static double ppBgTwo = 0.0;
+
+    // "Create ratio and total brightness image"
+    private static double ratioBgDonor = 0.0;
+    private static double ratioBgAcceptor = 0.0;
+
+    // "Track one ROI with math"
+    private static String trackRadiusText = "5";
+    private static String trackThresholdText = "0";
+
+    // "Create median filtered images"
+    private static double medianRadiusSetting = 2.0;
+
+    // "Create ROI's with cellpose"
+    private static String cellposeDiameterText = "80";
+
+    // "Adjust H and B" window
+    private static int huePresetSelected = 0;        // 0 = none, 1/2/4/5 = preset checkbox that was ticked
+    private static boolean hueAdvancedShown = false; // were the advanced hue settings unfolded?
+
+    // Settings of the two pixel-value-graph dialogs (percentile / advanced / thresholds)
+    private static class GraphSettings {
+        String pixelTitle = null;
+        String roiTitle = null;
+        int percentile = 0;                          // 0 = none, otherwise 99 / 95 / 80
+        boolean advanced = false;
+        List<String[]> rows = new ArrayList<>();     // each row = {video title, min text, max text}
+    }
+    private static final GraphSettings manualGraphSettings = new GraphSettings();  // manual drawn ROI
+    private static final GraphSettings storedRoiSettings = new GraphSettings();    // stored ROI's
+
+    /** Returns the remembered title if that image is still open, otherwise the fallback entry. */
+    private static String rememberedChoice(String key, String[] titles, int fallbackIndex) {
+        String saved = lastImageChoice.get(key);
+        if (saved != null) {
+            for (String t : titles) {
+                if (saved.equals(t)) return t;
+            }
+        }
+        if (titles == null || titles.length == 0) return "";
+        return titles[Math.min(Math.max(fallbackIndex, 0), titles.length - 1)];
+    }
+
+    private static void rememberChoice(String key, String title) {
+        if (title != null) lastImageChoice.put(key, title);
+    }
+
+    /** Selects the given title in a combo box, if it is present. */
+    private static void selectTitle(JComboBox<String> box, String title) {
+        if (box == null || title == null) return;
+        for (int i = 0; i < box.getItemCount(); i++) {
+            if (title.equals(box.getItemAt(i))) {
+                box.setSelectedIndex(i);
+                return;
+            }
+        }
+    }
+
+    /** Stores the current state of a pixel-value-graph dialog. roiBox may be null. */
+    private static void saveGraphSettings(GraphSettings gs,
+            JComboBox<String> pixelBox, JComboBox<String> roiBox,
+            JCheckBox cb99, JCheckBox cb95, JCheckBox cb80, JCheckBox advancedCheckBox,
+            List<JComboBox<String>> dropdowns, List<JTextField> minFields, List<JTextField> maxFields) {
+
+        gs.pixelTitle = (String) pixelBox.getSelectedItem();
+        if (roiBox != null) gs.roiTitle = (String) roiBox.getSelectedItem();
+        gs.percentile = cb99.isSelected() ? 99 : cb95.isSelected() ? 95 : cb80.isSelected() ? 80 : 0;
+        gs.advanced = advancedCheckBox.isSelected();
+        gs.rows = new ArrayList<>();
+        for (int i = 0; i < dropdowns.size(); i++) {
+            gs.rows.add(new String[] {
+                (String) dropdowns.get(i).getSelectedItem(),
+                minFields.get(i).getText().trim(),
+                maxFields.get(i).getText().trim()
+            });
+        }
+    }
+
+    /** Puts the remembered state back into a freshly built pixel-value-graph dialog. roiBox may be null. */
+    private static void restoreGraphSettings(GraphSettings gs,
+            JComboBox<String> pixelBox, JComboBox<String> roiBox,
+            JCheckBox cb99, JCheckBox cb95, JCheckBox cb80, JCheckBox advancedCheckBox,
+            JPanel advancedPanel, JPanel percentilePanel,
+            List<JComboBox<String>> dropdowns, List<JTextField> minFields, List<JTextField> maxFields,
+            Runnable addThresholdRow) {
+
+        selectTitle(pixelBox, gs.pixelTitle);
+        selectTitle(roiBox, gs.roiTitle);
+
+        if (gs.advanced) {
+            advancedCheckBox.setSelected(true);
+            advancedPanel.setVisible(true);
+            percentilePanel.setVisible(false);
+        } else {
+            cb99.setSelected(gs.percentile == 99);
+            cb95.setSelected(gs.percentile == 95);
+            cb80.setSelected(gs.percentile == 80);
+        }
+
+        if (gs.rows != null && !gs.rows.isEmpty()) {
+            while (dropdowns.size() < gs.rows.size()) {
+                addThresholdRow.run();   // adds another (empty) threshold row
+            }
+            for (int i = 0; i < gs.rows.size(); i++) {
+                String[] row = gs.rows.get(i);
+                selectTitle(dropdowns.get(i), row[0]);
+                minFields.get(i).setText(row[1]);
+                maxFields.get(i).setText(row[2]);
+            }
+        }
+    }
+    // =====================================================================
+
    
 
     
@@ -166,7 +301,7 @@ public class AR_IA implements PlugIn {
 
         JFrame frame = new JFrame("Select Video Processing Option");
         frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
-        frame.setSize(600, 600);
+        frame.setSize(600, 700);
         frame.setLayout(new BorderLayout());
 
         // Create a panel to hold the components and center them
@@ -325,6 +460,32 @@ public class AR_IA implements PlugIn {
             }
        
         });
+        
+        
+        JButton batchButton = new JButton("Batch process all images in a folder");
+        batchButton.setPreferredSize(new Dimension(200, 40));
+        batchButton.setMinimumSize(new Dimension(200, 40));
+        batchButton.setMaximumSize(new Dimension(400, 40));
+        batchButton.addActionListener(new ActionListener() {
+            public void actionPerformed(ActionEvent e) {
+                sampleName = sampleNameField.getText().trim();
+                frame.dispose();
+                batchProcess();
+            }
+        });
+
+        JButton SaveAllButton = new JButton("save all current open images/graphs");
+        SaveAllButton.setPreferredSize(new Dimension(200, 40)); // Set preferred button size
+        SaveAllButton.setMinimumSize(new Dimension(200, 40)); // Set minimum button size
+        SaveAllButton.setMaximumSize(new Dimension(400, 40)); // Set maximum button size
+        SaveAllButton.addActionListener(new ActionListener() {
+            public void actionPerformed(ActionEvent e) {
+                sampleName = sampleNameField.getText().trim(); // Retrieve and store the sample name
+                frame.dispose(); // Close the window
+                saveAllOpenTiffs(); // Call the pixel value method
+            }
+       
+        });
         // Create a panel to center the buttons
         JPanel buttonPanel = new JPanel();
         buttonPanel.setLayout(new BoxLayout(buttonPanel, BoxLayout.Y_AXIS)); // Stack buttons vertically
@@ -362,6 +523,13 @@ public class AR_IA implements PlugIn {
         buttonPanel.add(valueperpixelButton);
         buttonPanel.add(Box.createRigidArea(new Dimension(0, 10)));
         
+
+        buttonPanel.add(batchButton);
+        buttonPanel.add(Box.createRigidArea(new Dimension(0, 10)));
+
+        buttonPanel.add(SaveAllButton);
+        buttonPanel.add(Box.createRigidArea(new Dimension(0, 10))); 
+        
         // Add the button panel to the main panel
         panel.add(buttonPanel);
 
@@ -371,6 +539,41 @@ public class AR_IA implements PlugIn {
         frame.setVisible(true);
     }
     private JFrame buttonPanelFrame; 
+    
+    private void saveAllOpenTiffs() {
+        int[] windowIDs = WindowManager.getIDList();
+
+        if (windowIDs == null || windowIDs.length == 0) {
+            IJ.showMessage("No images are currently open.");
+            return;
+        }
+
+        // Prompt user to select a directory
+        DirectoryChooser dc = new DirectoryChooser("Select folder to save TIFF files");
+        String saveDir = dc.getDirectory();
+
+        if (saveDir == null) {
+            // User cancelled the dialog
+            return;
+        }
+
+        int savedCount = 0;
+        for (int id : windowIDs) {
+            ImagePlus imp = WindowManager.getImage(id);
+            if (imp == null) continue;
+
+            String title = imp.getTitle();
+            // Strip any existing extension, then add .tif
+            String baseName = title.replaceAll("\\.[^.]+$", "");
+            String safeName = baseName.replaceAll("[\\\\/:*?\"<>|]", "_");
+
+            String outputPath = saveDir + safeName + ".tif";
+            IJ.save(imp, outputPath);
+            savedCount++;
+        }
+
+        IJ.showMessage("Saved " + savedCount + " image(s) to:\n" + saveDir);
+    }
     
     private void valueperpixel() {
     	
@@ -435,12 +638,12 @@ public class AR_IA implements PlugIn {
    	    }
 
    	    // Allow the user to select from open images
-   	    gd.addChoice("Select first image Channel:", imageTitles, imageTitles.length > 0 ? imageTitles[0] : "");
-   	    gd.addChoice("Select second image Channel:", imageTitles, imageTitles.length > 1 ? imageTitles[1] : "");
+   	    gd.addChoice("Select first image Channel:", imageTitles, rememberedChoice("pv1", imageTitles, 0));
+   	    gd.addChoice("Select second image Channel:", imageTitles, rememberedChoice("pv2", imageTitles, 1));
 
   
-   	    gd.addNumericField("Background image one:", 0.0, 2);
-   	    gd.addNumericField("Background image two:", 0.0, 2);
+   	    gd.addNumericField("Background image one:", ppBgOne, 2);
+   	    gd.addNumericField("Background image two:", ppBgTwo, 2);
 
 
    	    gd.showDialog();
@@ -452,9 +655,13 @@ public class AR_IA implements PlugIn {
    	// Get selected choices and parameters
    	 String selectedpiximpone = gd.getNextChoice();
    	 String selectedpiximptwo = gd.getNextChoice();
+   	 rememberChoice("pv1", selectedpiximpone);
+   	 rememberChoice("pv2", selectedpiximptwo);
 
    	 double bgDonor = gd.getNextNumber();
+   	 ppBgOne = bgDonor;
    	 double bgAcceptor = gd.getNextNumber();
+   	 ppBgTwo = bgAcceptor;
 
    	 // Get the selected images
    	 ImagePlus pixvalimgone = WindowManager.getImage(selectedpiximpone);
@@ -475,19 +682,19 @@ public class AR_IA implements PlugIn {
         try (BufferedWriter writer = new BufferedWriter(new FileWriter(csvFile))) {
 
             writer.write("frame,pixel_index,image1,image2\n");
-
+            
             for (int f = 1; f <= frames; f++) {
 
-    IJ.showProgress(f, frames);
+                IJ.showProgress(f, frames);
 
-    ImageProcessor ip1raw = stack1.getProcessor(f);
-    ImageProcessor ip2raw = stack2.getProcessor(f);
+                ImageProcessor ip1raw = stack1.getProcessor(f);
+                ImageProcessor ip2raw = stack2.getProcessor(f);
 
-    FloatProcessor fp1 = (ip1raw instanceof FloatProcessor) ? (FloatProcessor) ip1raw : ip1raw.convertToFloatProcessor();
-    FloatProcessor fp2 = (ip2raw instanceof FloatProcessor) ? (FloatProcessor) ip2raw : ip2raw.convertToFloatProcessor();
+                FloatProcessor fp1 = (ip1raw instanceof FloatProcessor) ? (FloatProcessor) ip1raw : ip1raw.convertToFloatProcessor();
+                FloatProcessor fp2 = (ip2raw instanceof FloatProcessor) ? (FloatProcessor) ip2raw : ip2raw.convertToFloatProcessor();
 
-    float[] pixels1 = (float[]) fp1.getPixels();
-    float[] pixels2 = (float[]) fp2.getPixels();
+                float[] pixels1 = (float[]) fp1.getPixels();
+                float[] pixels2 = (float[]) fp2.getPixels();
 
                 int pixelCount = pixels1.length;
 
@@ -657,10 +864,10 @@ public class AR_IA implements PlugIn {
            dialog.setLayout(new FlowLayout());
 
            JLabel label1 = new JLabel("Draw an ROI, then set pixel radius:");
-           JTextField radiusField = new JTextField("5", 5); // default radius
+           JTextField radiusField = new JTextField(trackRadiusText, 5); // remembered radius (default 5)
 
            JLabel label2 = new JLabel("Set threshold for optimal ROI:");
-           JTextField thresholdField = new JTextField("0", 5); // default threshold
+           JTextField thresholdField = new JTextField(trackThresholdText, 5); // remembered threshold (default 0)
 
            JButton continueButton = new JButton("Continue");
            JButton cancelButton = new JButton("Cancel");
@@ -669,6 +876,8 @@ public class AR_IA implements PlugIn {
                try {
                    int pixelRadius = Integer.parseInt(radiusField.getText());
                    double threshold = Double.parseDouble(thresholdField.getText());
+                   trackRadiusText = radiusField.getText().trim();
+                   trackThresholdText = thresholdField.getText().trim();
                    processROI(pixelRadius, threshold);
                    dialog.dispose();
                } catch (NumberFormatException ex) {
@@ -913,8 +1122,8 @@ public class AR_IA implements PlugIn {
         }
 
         GenericDialog gd = new GenericDialog("Select Image to Filter");
-        gd.addChoice("Select file to filter:", imageTitles, imageTitles[0]);
-        gd.addNumericField("Median Filter Radius:", 2.0, 1); // default radius
+        gd.addChoice("Select file to filter:", imageTitles, rememberedChoice("median", imageTitles, 0));
+        gd.addNumericField("Median Filter Radius:", medianRadiusSetting, 1); // remembered radius (default 2.0)
         gd.showDialog();
         if (gd.wasCanceled()) {
             createMainMenu();
@@ -924,6 +1133,8 @@ public class AR_IA implements PlugIn {
 
         String selectedTitle = gd.getNextChoice();
         double MedianFilterRadius = gd.getNextNumber();
+        medianRadiusSetting = MedianFilterRadius;
+        rememberChoice("median", selectedTitle);
 
         // Find the selected image by matching title
         ImagePlus toFilterImp = null;
@@ -1029,12 +1240,12 @@ public class AR_IA implements PlugIn {
    	    }
 
    	    // Allow the user to select from open images
-   	    gd.addChoice("Select donor Channel:", imageTitles, imageTitles.length > 0 ? imageTitles[0] : "");
-   	    gd.addChoice("Select acceptor Channel:", imageTitles, imageTitles.length > 1 ? imageTitles[1] : "");
+   	    gd.addChoice("Select donor Channel:", imageTitles, rememberedChoice("ratioDonor", imageTitles, 0));
+   	    gd.addChoice("Select acceptor Channel:", imageTitles, rememberedChoice("ratioAcceptor", imageTitles, 1));
 
   
-   	    gd.addNumericField("Background donor:", 0.0, 2);
-   	    gd.addNumericField("Background acceptor:", 0.0, 2);
+   	    gd.addNumericField("Background donor:", ratioBgDonor, 2);
+   	    gd.addNumericField("Background acceptor:", ratioBgAcceptor, 2);
 
 
    	    gd.showDialog();
@@ -1046,9 +1257,13 @@ public class AR_IA implements PlugIn {
    	    // Get selected choices and parameters
    	    String selectedDonor = gd.getNextChoice();
    	    String selectedAcceptor = gd.getNextChoice();
+   	    rememberChoice("ratioDonor", selectedDonor);
+   	    rememberChoice("ratioAcceptor", selectedAcceptor);
 
    	    double bgDonor = gd.getNextNumber();
+   	    ratioBgDonor = bgDonor;
    	    double bgAcceptor = gd.getNextNumber();
+   	    ratioBgAcceptor = bgAcceptor;
 
    	    // Assign selected images based on the dialog
    	    donorImp = WindowManager.getImage(selectedDonor);    	            
@@ -1206,8 +1421,8 @@ public class AR_IA implements PlugIn {
     	    }
 
     	    // Allow the user to select from open images
-    	    gd.addChoice("Select Parallel Channel:", imageTitles, imageTitles.length > 0 ? imageTitles[0] : "");
-    	    gd.addChoice("Select Perpendicular Channel:", imageTitles, imageTitles.length > 1 ? imageTitles[1] : "");
+    	    gd.addChoice("Select Parallel Channel:", imageTitles, rememberedChoice("aniParallel", imageTitles, 0));
+    	    gd.addChoice("Select Perpendicular Channel:", imageTitles, rememberedChoice("aniPerpendicular", imageTitles, 1));
 
     	    // Add fields for additional parameters
     	    gd.addNumericField("G-factor:", gFactor, 2);
@@ -1224,6 +1439,8 @@ public class AR_IA implements PlugIn {
     	    // Get selected choices and parameters
     	    String selectedParallel = gd.getNextChoice();
     	    String selectedPerpendicular = gd.getNextChoice();
+    	    rememberChoice("aniParallel", selectedParallel);
+    	    rememberChoice("aniPerpendicular", selectedPerpendicular);
     	    gFactor = gd.getNextNumber();
     	    bgParallel = gd.getNextNumber();
     	    bgPerpendicular = gd.getNextNumber();
@@ -1364,8 +1581,8 @@ public class AR_IA implements PlugIn {
     		    }
 
     		    // Allow the user to select from open images
-    		    gd.addChoice("Select H Channel:", imageTitles, imageTitles.length > 0 ? imageTitles[0] : "");
-    		    gd.addChoice("Select B Channel:", imageTitles, imageTitles.length > 1 ? imageTitles[1] : "");
+    		    gd.addChoice("Select H Channel:", imageTitles, rememberedChoice("hsbH", imageTitles, 0));
+    		    gd.addChoice("Select B Channel:", imageTitles, rememberedChoice("hsbB", imageTitles, 1));
 
     		    // Show the dialog
     		    gd.showDialog();
@@ -1376,6 +1593,8 @@ public class AR_IA implements PlugIn {
     		    // Get selected choices
     		    String selectedHChannel = gd.getNextChoice();
     		    String selectedBChannel = gd.getNextChoice();
+    		    rememberChoice("hsbH", selectedHChannel);
+    		    rememberChoice("hsbB", selectedBChannel);
 
     		    // Assign selected images based on the dialog
     		    imp1 = WindowManager.getImage(selectedHChannel);
@@ -1597,8 +1816,8 @@ public class AR_IA implements PlugIn {
         gbc.gridwidth = 2;
         mainPanel.add(directionLabel, gbc);
 
-        JCheckBox clockwiseCheckBox = new JCheckBox("Clockwise", false);
-        JCheckBox counterClockwiseCheckBox = new JCheckBox("Counterclockwise", true);
+        JCheckBox clockwiseCheckBox = new JCheckBox("Clockwise", !counterClockwise);
+        JCheckBox counterClockwiseCheckBox = new JCheckBox("Counterclockwise", counterClockwise);
 
         // Button group to ensure only one selection is possible
         ButtonGroup directionGroup = new ButtonGroup();
@@ -1639,7 +1858,7 @@ public class AR_IA implements PlugIn {
         
         
         //hue bar check box
-        JCheckBox hueBarInVideoCheckBox = new JCheckBox("select for hue-bar appended to video", true);
+        JCheckBox hueBarInVideoCheckBox = new JCheckBox("select for hue-bar appended to video", hueBarInVideo);
 
         gbc.gridx = 2;
         gbc.gridy = 15;
@@ -1824,6 +2043,12 @@ public class AR_IA implements PlugIn {
         applyButton.addActionListener(e -> {
         
             counterClockwise = counterClockwiseCheckBox.isSelected();
+            hueBarInVideo = hueBarInVideoCheckBox.isSelected();
+            hueAdvancedShown = hideCheckBox.isVisible();
+            huePresetSelected = firstCheckBox.isSelected() ? 1
+                              : secondCheckBox.isSelected() ? 2
+                              : fourthCheckBox.isSelected() ? 4
+                              : fifthCheckBox.isSelected() ? 5 : 0;
         
             try {
             	brightnessMultiplier = Float.parseFloat(multiplierField.getText());
@@ -1832,6 +2057,7 @@ public class AR_IA implements PlugIn {
                theoMax = maxZoom= Float.parseFloat(maxZoomField.getText());
                 hueStartColour = Float.parseFloat(hueStartField.getText());
                 hueEndColour = Float.parseFloat(hueEndField.getText());
+                maxHistoValue = Float.parseFloat(histoField.getText());
             } catch (NumberFormatException ex) {
                 IJ.error("Invalid input for values. Check if notation is point and not comma");
                 return;
@@ -1871,6 +2097,37 @@ public class AR_IA implements PlugIn {
             DisplayAnisoGraph();
             
         });
+        // ---- restore the settings of the previous use ----
+        if (hueAdvancedShown) {
+            hueStartLabel.setVisible(true);
+            hueStartField.setVisible(true);
+            hueEndLabel.setVisible(true);
+            hueEndField.setVisible(true);
+            clockwiseCheckBox.setVisible(true);
+            counterClockwiseCheckBox.setVisible(true);
+            directionLabel.setVisible(true);
+            multiplierLabel.setVisible(true);
+            multiplierField.setVisible(true);
+            exponentLabel.setVisible(true);
+            exponentField.setVisible(true);
+            visualizeLabel.setVisible(true);
+            visualizeCheckBox.setVisible(true);
+            thirdCheckBox.setVisible(false);
+            hideCheckBox.setVisible(true);
+            hideCheckBox.setSelected(false);
+            thirdCheckBox.setSelected(true);   // same state as after clicking "show advanced settings"
+        }
+        // preset checkboxes (setSelected does not fire the listeners, so the remembered field values stay)
+        if      (huePresetSelected == 1) firstCheckBox.setSelected(true);
+        else if (huePresetSelected == 2) secondCheckBox.setSelected(true);
+        else if (huePresetSelected == 4) fourthCheckBox.setSelected(true);
+        else if (huePresetSelected == 5) fifthCheckBox.setSelected(true);
+        if (hueAdvancedShown) {
+            mainPanel.revalidate();
+            mainPanel.repaint();
+            frame.pack();
+        }
+
         hueBarInVideoCheckBox.addActionListener(e -> {
             hueBarInVideo = hueBarInVideoCheckBox.isSelected();
         });
@@ -2152,6 +2409,11 @@ public class AR_IA implements PlugIn {
     	    panel.add(advancedPanel, gbc);
     	    gbc.insets = new Insets(5, 10, 5, 10);
 
+    	    // ---- restore the settings of the previous use ----
+    	    restoreGraphSettings(manualGraphSettings, pixelValueComboBox, roiComboBox,
+    	            cb99, cb95, cb80, advancedCheckBox, advancedPanel, percentilePanel,
+    	            thresholdDropdowns, thresholdMinFields, thresholdMaxFields, addThresholdRow);
+
     	    // Toggle advanced panel and percentile panel
     	    advancedCheckBox.addActionListener(e -> {
     	        boolean advanced = advancedCheckBox.isSelected();
@@ -2173,6 +2435,9 @@ public class AR_IA implements PlugIn {
     	    JButton cancelButton = new JButton("Cancel");
 
     	    okButton.addActionListener(e -> {
+    	        saveGraphSettings(manualGraphSettings, pixelValueComboBox, roiComboBox,
+    	                cb99, cb95, cb80, advancedCheckBox,
+    	                thresholdDropdowns, thresholdMinFields, thresholdMaxFields);
     	        String pixelValueImageTitle = (String) pixelValueComboBox.getSelectedItem();
     	        pixelValueImp = WindowManager.getImage(pixelValueImageTitle);
 
@@ -2559,6 +2824,7 @@ public class AR_IA implements PlugIn {
 
     		 // JComboBox and other components setup (unchanged)
     		    JComboBox<String> videoDropdown = new JComboBox<>(videoTitles);
+    		    selectTitle(videoDropdown, lastImageChoice.get("cellposeVideo"));
     		    gbc.gridx = 1;
     		    gbc.gridy = 0;
     		    gbc.gridwidth = 3;
@@ -2571,7 +2837,7 @@ public class AR_IA implements PlugIn {
     		    gbc.gridwidth = 1;
     		    mainPanel.add(diameterLabel, gbc);
 
-    		    JTextField diameterField = new JTextField("80", 10);  // Pre-filled with default value
+    		    JTextField diameterField = new JTextField(cellposeDiameterText, 10);  // remembered value (default 80)
     		    gbc.gridx = 1;
     		    gbc.gridy = 1;
     		    gbc.gridwidth = 2;
@@ -2600,13 +2866,13 @@ public class AR_IA implements PlugIn {
     	        mainPanel.add(frameLabel, gbc);
 
     	        
-    	        JCheckBox frameOneCheckBox = new JCheckBox("first frame", false);
+    	        JCheckBox frameOneCheckBox = new JCheckBox("first frame", oneFrame && !allFrame);
     	        gbc.gridx = 1;
     	        gbc.gridy = 3;
     	        gbc.gridwidth = 1;
     	        mainPanel.add(frameOneCheckBox, gbc);
     	        
-    	        JCheckBox frameAllCheckBox = new JCheckBox("all frames", false);
+    	        JCheckBox frameAllCheckBox = new JCheckBox("all frames", allFrame && !oneFrame);
     	        gbc.gridx = 1;
     	        gbc.gridy = 4;
     	        gbc.gridwidth = 1;
@@ -2640,6 +2906,8 @@ public class AR_IA implements PlugIn {
     		        okButton.addActionListener(e -> {
     		            String selectedVideo = (String) videoDropdown.getSelectedItem();
     		            diameterValue = diameterField.getText();  // Store diameter in instance variable
+    		            cellposeDiameterText = diameterField.getText().trim();
+    		            rememberChoice("cellposeVideo", selectedVideo);
 
     		            // Find the ImagePlus corresponding to the selected video
     		            for (int id : finalWindowIDs) {
@@ -3058,6 +3326,11 @@ public class AR_IA implements PlugIn {
     	        gbc.gridx = 0; gbc.gridy = 3; gbc.gridwidth = 4;
     	        mainPanel.add(advancedPanel, gbc);
 
+    	        // ---- restore the settings of the previous use ----
+    	        restoreGraphSettings(storedRoiSettings, primaryVideoDropdown, null,
+    	                cb99, cb95, cb80, advancedCheckBox, advancedPanel, percentilePanel,
+    	                thresholdDropdowns, thresholdMinFields, thresholdMaxFields, addThresholdRow);
+
     	        // Toggle advanced panel and percentile panel
     	        advancedCheckBox.addActionListener(e -> {
     	            boolean advanced = advancedCheckBox.isSelected();
@@ -3099,6 +3372,9 @@ public class AR_IA implements PlugIn {
     	        dialog.setVisible(true);
 
     	        if (confirmed[0]) {
+    	            saveGraphSettings(storedRoiSettings, primaryVideoDropdown, null,
+    	                    cb99, cb95, cb80, advancedCheckBox,
+    	                    thresholdDropdowns, thresholdMinFields, thresholdMaxFields);
     	            String primaryVideoTitle = (String) primaryVideoDropdown.getSelectedItem();
 
     	            // Determine percentile
@@ -3453,6 +3729,8 @@ public class AR_IA implements PlugIn {
 
     			        // Display the plot
     			        plot.show();
+    			        
+    			        
     			    }
 
     		        createMainMenu();
@@ -3698,6 +3976,1045 @@ public class AR_IA implements PlugIn {
     	}
 
     	
+
+    // =====================================================================
+    //  BATCH PROCESSOR
+    //  Runs the analyses of this plugin on every file of a folder. Each file
+    //  holds both channels of one sample; all results of a file are saved in
+    //  their own sub-folder (named after the file) inside the input folder.
+    // =====================================================================
+    private static final String P_C1 = "Channel 1";
+    private static final String P_C2 = "Channel 2";
+    private static final String P_ANI = "Anisotropy";
+    private static final String P_ANI_TOT = "Total intensity (anisotropy)";
+    private static final String P_RAT = "Ratio";
+    private static final String P_RAT_TOT = "Total intensity (ratio)";
+    private static final String[] PRODUCT_NAMES = { P_C1, P_C2, P_ANI, P_ANI_TOT, P_RAT, P_RAT_TOT };
+    private static final String NONE = "none";
+
+    private static final String LAYOUT_HYPER = "Hyperstack with 2 channels (C=2)";
+    private static final String LAYOUT_INTERLEAVED = "Interleaved slices (ch1, ch2, ch1, ch2, ...)";
+    private static final String LAYOUT_HALVES = "First half = channel 1, second half = channel 2";
+    private static final String[] LAYOUTS = { LAYOUT_HYPER, LAYOUT_INTERLEAVED, LAYOUT_HALVES };
+    private static final String[] MEDIAN_MODES = {
+        "Off",
+        "Filter and save the filtered channels",
+        "Filter, save, and use the filtered channels for all other steps" };
+    private static final String[] HUE_PRESETS = {
+        "custom (use the values below)", "green-yellow-red-magenta", "blue-magenta",
+        "magenta-red-yellow-green", "magenta-blue" };
+    private static final String[] PERCENTILES = { "none (use thresholds)", "99%", "95%", "80%" };
+    private static final String[] ROI_FRAME_MODES = {
+        "ROIs of the first frame applied to all frames", "One ROI zip per frame" };
+
+    /** All batch settings; static so they are remembered until Fiji is closed. */
+    private static class BatchConfig {
+        String inputDir;
+        String extensions = "tif,tiff";
+        String layout = LAYOUT_HYPER;
+        boolean swapChannels = false;
+        int medianMode = 0;
+        boolean skipExisting = false;
+
+        boolean doAnisotropy = true, doRatio = false, doHsb = false;
+        boolean doCellpose = false, doGraphStored = false, doGraphManual = false;
+
+        // Hue-Brightness movie
+        String hsbSource = P_ANI;
+        float hueMin = -0.2f, hueMax = 0.4f;
+        String huePreset = HUE_PRESETS[0];
+        float hueStart = 0.3f, hueEnd = 0.86f;
+        boolean hueCcw = true;
+        boolean autoBrightness = false;
+        float brightMin = 0f, brightMax = 1f, brightMult = 1f, brightExp = 1f;
+        boolean hueBar = true;
+
+        // ROI's
+        String cellposeTemplate = P_ANI_TOT;
+        String roiSubfolder = "cellpose";
+        boolean roiAllFrames = false;
+
+        // Graphs
+        String graphTarget = P_ANI;
+        int percentileIndex = 0;
+        String[] thrImg = { NONE, NONE };
+        String[] thrMin = { "", "" };
+        String[] thrMax = { "", "" };
+        String manualRoiImage = null;
+
+        // run-time only
+        Roi manualRoi = null;
+        String python = null;
+    }
+    private static final BatchConfig batchCfg = new BatchConfig();
+
+    // ------------------------------------------------------------------
+    //  Dialogs
+    // ------------------------------------------------------------------
+    private void batchProcess() {
+        DirectoryChooser dc = new DirectoryChooser("Select the folder with the images to batch process");
+        String dir = dc.getDirectory();
+        if (dir == null) { createMainMenu(); return; }
+        final BatchConfig c = batchCfg;
+        c.inputDir = dir;
+
+        GenericDialog gd = new GenericDialog("Batch processor");
+        gd.addMessage("Folder: " + dir + "\n"
+            + "Every file of this folder is analysed. The results of each file are saved in\n"
+            + "a sub-folder named after that file, inside this folder.\n"
+            + "Channel 1 = parallel / donor, channel 2 = perpendicular / acceptor.");
+        gd.addStringField("File extensions (comma separated):", c.extensions, 14);
+        gd.addChoice("Channel layout in each file:", LAYOUTS, c.layout);
+        gd.addCheckbox("Swap channels (channel 1 = perpendicular / acceptor)", c.swapChannels);
+        gd.addChoice("Median filter:", MEDIAN_MODES, MEDIAN_MODES[c.medianMode]);
+        gd.addMessage("Analyses to run on every file:");
+        gd.addCheckbox("Anisotropy + total intensity images", c.doAnisotropy);
+        gd.addCheckbox("Ratio + total intensity images", c.doRatio);
+        gd.addCheckbox("Hue-Brightness (HSB) movie", c.doHsb);
+        gd.addCheckbox("ROI's with Cellpose", c.doCellpose);
+        gd.addCheckbox("Pixel value graph with stored ROI's (e.g. made by Cellpose)", c.doGraphStored);
+        gd.addCheckbox("Pixel value graph with one manual ROI (taken from an open image)", c.doGraphManual);
+        gd.addCheckbox("Skip files that already have an output folder", c.skipExisting);
+        gd.showDialog();
+        if (gd.wasCanceled()) { createMainMenu(); return; }
+
+        c.extensions = gd.getNextString().trim();
+        c.layout = gd.getNextChoice();
+        c.swapChannels = gd.getNextBoolean();
+        c.medianMode = gd.getNextChoiceIndex();
+        c.doAnisotropy = gd.getNextBoolean();
+        c.doRatio = gd.getNextBoolean();
+        c.doHsb = gd.getNextBoolean();
+        c.doCellpose = gd.getNextBoolean();
+        c.doGraphStored = gd.getNextBoolean();
+        c.doGraphManual = gd.getNextBoolean();
+        c.skipExisting = gd.getNextBoolean();
+
+        final List<File> files = listBatchFiles(dir, c.extensions);
+        if (files.isEmpty()) {
+            IJ.showMessage("Batch processor", "No files with extension(s) \"" + c.extensions + "\" found in:\n" + dir);
+            createMainMenu();
+            return;
+        }
+        boolean anyAnalysis = c.doAnisotropy || c.doRatio || c.doHsb || c.doCellpose
+                || c.doGraphStored || c.doGraphManual || c.medianMode > 0;
+        if (!anyAnalysis) {
+            IJ.showMessage("Batch processor", "Nothing selected to run.");
+            createMainMenu();
+            return;
+        }
+
+        // ---- median filter radius ----
+        if (c.medianMode > 0) {
+            GenericDialog md = new GenericDialog("Batch: median filter");
+            md.addNumericField("Median filter radius:", medianRadiusSetting, 1);
+            md.showDialog();
+            if (md.wasCanceled()) { createMainMenu(); return; }
+            medianRadiusSetting = md.getNextNumber();
+        }
+
+        // ---- HSB settings ----
+        if (c.doHsb) {
+            GenericDialog hd = new GenericDialog("Batch: Hue-Brightness movie");
+            hd.addChoice("Hue (H) image made from:", new String[] { P_ANI, P_RAT }, c.hsbSource);
+            hd.addMessage("The brightness (B) image is the total intensity belonging to that hue image.");
+            hd.addNumericField("Min hue value:", c.hueMin, 3);
+            hd.addNumericField("Max hue value:", c.hueMax, 3);
+            hd.addChoice("Hue preset:", HUE_PRESETS, c.huePreset);
+            hd.addNumericField("Hue starting colour:", c.hueStart, 3);
+            hd.addNumericField("Hue ending colour:", c.hueEnd, 3);
+            hd.addChoice("Hue direction in the colour circle:", new String[] { "Counterclockwise", "Clockwise" },
+                    c.hueCcw ? "Counterclockwise" : "Clockwise");
+            hd.addCheckbox("Automatic brightness range per file (min/max of the total intensity)", c.autoBrightness);
+            hd.addNumericField("Brightness min (when not automatic):", c.brightMin, 3);
+            hd.addNumericField("Brightness max (when not automatic):", c.brightMax, 3);
+            hd.addNumericField("Brightness multiplier:", c.brightMult, 3);
+            hd.addNumericField("Brightness exponent:", c.brightExp, 3);
+            hd.addCheckbox("Append hue bar to the movie", c.hueBar);
+            hd.showDialog();
+            if (hd.wasCanceled()) { createMainMenu(); return; }
+            c.hsbSource = hd.getNextChoice();
+            c.hueMin = (float) hd.getNextNumber();
+            c.hueMax = (float) hd.getNextNumber();
+            c.huePreset = hd.getNextChoice();
+            int presetIdx = 0;
+            c.hueStart = (float) hd.getNextNumber();
+            c.hueEnd = (float) hd.getNextNumber();
+            c.hueCcw = hd.getNextChoiceIndex() == 0;
+            c.autoBrightness = hd.getNextBoolean();
+            c.brightMin = (float) hd.getNextNumber();
+            c.brightMax = (float) hd.getNextNumber();
+            c.brightMult = (float) hd.getNextNumber();
+            c.brightExp = (float) hd.getNextNumber();
+            c.hueBar = hd.getNextBoolean();
+            // presets override start / end / direction
+            for (int i = 0; i < HUE_PRESETS.length; i++) {
+                if (HUE_PRESETS[i].equals(c.huePreset)) presetIdx = i;
+            }
+            if (presetIdx == 1) { c.hueStart = 0.3f;  c.hueEnd = 0.86f; c.hueCcw = true;  }
+            if (presetIdx == 2) { c.hueStart = 0.63f; c.hueEnd = 0.9f;  c.hueCcw = false; }
+            if (presetIdx == 3) { c.hueStart = 0.86f; c.hueEnd = 0.3f;  c.hueCcw = false; }
+            if (presetIdx == 4) { c.hueStart = 0.9f;  c.hueEnd = 0.63f; c.hueCcw = true;  }
+            if (c.hueMax == c.hueMin) {
+                IJ.error("Batch processor", "Min hue value and max hue value must be different.");
+                createMainMenu();
+                return;
+            }
+            if (!c.autoBrightness && c.brightMax == c.brightMin) {
+                IJ.error("Batch processor", "Brightness min and max must be different.");
+                createMainMenu();
+                return;
+            }
+        }
+
+        // ---- Cellpose settings ----
+        if (c.doCellpose) {
+            GenericDialog cd = new GenericDialog("Batch: Cellpose");
+            cd.addChoice("Image used to find the cells:", PRODUCT_NAMES, c.cellposeTemplate);
+            cd.addStringField("Diameter of average cell (pixels, 0 = automatic):", cellposeDiameterText, 8);
+            addRoiLocationFields(cd, c);
+            cd.showDialog();
+            if (cd.wasCanceled()) { createMainMenu(); return; }
+            c.cellposeTemplate = cd.getNextChoice();
+            cellposeDiameterText = cd.getNextString().trim();
+            readRoiLocationFields(cd, c);
+            c.python = findPythonInterpreter();
+            if (c.python == null) {
+                IJ.showMessage("Batch processor", "No Python interpreter found, so Cellpose cannot be run.");
+                createMainMenu();
+                return;
+            }
+        }
+
+        // ---- Graph settings ----
+        if (c.doGraphStored || c.doGraphManual) {
+            String[] roiImages = new String[0];
+            if (c.doGraphManual) {
+                List<String> withRoi = new ArrayList<>();
+                int[] ids = WindowManager.getIDList();
+                if (ids != null) {
+                    for (int id : ids) {
+                        ImagePlus img = WindowManager.getImage(id);
+                        if (img != null && img.getRoi() != null) withRoi.add(img.getTitle());
+                    }
+                }
+                if (withRoi.isEmpty()) {
+                    IJ.showMessage("Batch processor",
+                        "For the manual ROI graph, draw a ROI on an open image first.\n"
+                      + "That ROI is then used for every file.");
+                    createMainMenu();
+                    return;
+                }
+                roiImages = withRoi.toArray(new String[0]);
+            }
+
+            String[] withNone = new String[PRODUCT_NAMES.length + 1];
+            withNone[0] = NONE;
+            System.arraycopy(PRODUCT_NAMES, 0, withNone, 1, PRODUCT_NAMES.length);
+
+            GenericDialog gg = new GenericDialog("Batch: pixel value graphs");
+            gg.addChoice("Image to measure:", PRODUCT_NAMES, c.graphTarget);
+            gg.addChoice("Use middle:", PERCENTILES, PERCENTILES[c.percentileIndex]);
+            gg.addMessage("Thresholds (only used when 'Use middle' is none; leave min/max empty for no limit):");
+            for (int t = 0; t < 2; t++) {
+                gg.addChoice("Threshold image " + (t + 1) + ":", withNone, c.thrImg[t]);
+                gg.addStringField("   min:", c.thrMin[t], 8);
+                gg.addStringField("   max:", c.thrMax[t], 8);
+            }
+            if (c.doGraphManual) {
+                String defImg = c.manualRoiImage;
+                boolean found = false;
+                for (String s : roiImages) if (s.equals(defImg)) found = true;
+                gg.addChoice("Image holding the manual ROI:", roiImages, found ? defImg : roiImages[0]);
+            }
+            if (c.doGraphStored && !c.doCellpose) addRoiLocationFields(gg, c);
+            gg.showDialog();
+            if (gg.wasCanceled()) { createMainMenu(); return; }
+
+            c.graphTarget = gg.getNextChoice();
+            c.percentileIndex = gg.getNextChoiceIndex();
+            for (int t = 0; t < 2; t++) {
+                c.thrImg[t] = gg.getNextChoice();
+                c.thrMin[t] = gg.getNextString().trim();
+                c.thrMax[t] = gg.getNextString().trim();
+            }
+            if (c.doGraphManual) {
+                c.manualRoiImage = gg.getNextChoice();
+                ImagePlus holder = WindowManager.getImage(c.manualRoiImage);
+                if (holder == null || holder.getRoi() == null) {
+                    IJ.showMessage("Batch processor", "The selected image no longer has a ROI.");
+                    createMainMenu();
+                    return;
+                }
+                c.manualRoi = (Roi) holder.getRoi().clone();
+            }
+            if (c.doGraphStored && !c.doCellpose) readRoiLocationFields(gg, c);
+
+            // validate threshold numbers
+            try {
+                for (int t = 0; t < 2; t++) {
+                    if (!c.thrMin[t].isEmpty()) Double.parseDouble(c.thrMin[t]);
+                    if (!c.thrMax[t].isEmpty()) Double.parseDouble(c.thrMax[t]);
+                }
+            } catch (NumberFormatException ex) {
+                IJ.error("Batch processor", "Invalid threshold value. Use a point as decimal separator.");
+                createMainMenu();
+                return;
+            }
+        }
+
+        // ---- which derived images are needed? ----
+        Set<String> needed = new HashSet<>();
+        if (c.doAnisotropy) { needed.add(P_ANI); needed.add(P_ANI_TOT); }
+        if (c.doRatio) { needed.add(P_RAT); needed.add(P_RAT_TOT); }
+        if (c.doHsb) {
+            if (P_ANI.equals(c.hsbSource)) { needed.add(P_ANI); needed.add(P_ANI_TOT); }
+            else { needed.add(P_RAT); needed.add(P_RAT_TOT); }
+        }
+        if (c.doCellpose) needed.add(c.cellposeTemplate);
+        if (c.doGraphStored || c.doGraphManual) {
+            needed.add(c.graphTarget);
+            for (int t = 0; t < 2; t++) if (!NONE.equals(c.thrImg[t])) needed.add(c.thrImg[t]);
+        }
+
+        if (needed.contains(P_ANI) || needed.contains(P_ANI_TOT)) {
+            GenericDialog ad = new GenericDialog("Batch: anisotropy settings");
+            ad.addNumericField("G-factor:", gFactor, 2);
+            ad.addNumericField("Background Parallel:", bgParallel, 2);
+            ad.addNumericField("Background Perpendicular:", bgPerpendicular, 2);
+            ad.addNumericField("F_corr:", fCorr, 2);
+            ad.showDialog();
+            if (ad.wasCanceled()) { createMainMenu(); return; }
+            gFactor = ad.getNextNumber();
+            bgParallel = ad.getNextNumber();
+            bgPerpendicular = ad.getNextNumber();
+            fCorr = ad.getNextNumber();
+        }
+        if (needed.contains(P_RAT) || needed.contains(P_RAT_TOT)) {
+            GenericDialog rd = new GenericDialog("Batch: ratio settings");
+            rd.addNumericField("Background donor:", ratioBgDonor, 2);
+            rd.addNumericField("Background acceptor:", ratioBgAcceptor, 2);
+            rd.showDialog();
+            if (rd.wasCanceled()) { createMainMenu(); return; }
+            ratioBgDonor = rd.getNextNumber();
+            ratioBgAcceptor = rd.getNextNumber();
+        }
+
+        if (!IJ.showMessageWithCancel("Batch processor",
+                "Process " + files.size() + " file(s) from:\n" + dir
+              + "\n\nExisting files with the same names inside the output sub-folders will be overwritten.\n"
+              + "Progress is reported in the Log window.")) {
+            createMainMenu();
+            return;
+        }
+
+        new Thread(() -> runBatch(c, files), "AR_IA batch").start();
+    }
+
+    private void addRoiLocationFields(GenericDialog gd, BatchConfig c) {
+        gd.addStringField("ROI sub-folder inside each file's folder:", c.roiSubfolder, 14);
+        gd.addChoice("ROI frame mode:", ROI_FRAME_MODES, ROI_FRAME_MODES[c.roiAllFrames ? 1 : 0]);
+    }
+
+    private void readRoiLocationFields(GenericDialog gd, BatchConfig c) {
+        String sub = gd.getNextString().trim().replaceAll("[\\\\/:*?\"<>|]", "_");
+        c.roiSubfolder = sub.isEmpty() ? "cellpose" : sub;
+        c.roiAllFrames = gd.getNextChoiceIndex() == 1;
+    }
+
+    private static List<File> listBatchFiles(String dir, String extensionsCsv) {
+        Set<String> exts = new HashSet<>();
+        for (String e : extensionsCsv.split(",")) {
+            e = e.trim().toLowerCase();
+            if (e.startsWith(".")) e = e.substring(1);
+            if (!e.isEmpty()) exts.add(e);
+        }
+        List<File> out = new ArrayList<>();
+        File[] all = new File(dir).listFiles();
+        if (all == null) return out;
+        for (File f : all) {
+            if (!f.isFile() || f.getName().startsWith(".")) continue;
+            String n = f.getName().toLowerCase();
+            int dot = n.lastIndexOf('.');
+            String ext = dot >= 0 ? n.substring(dot + 1) : "";
+            if (exts.isEmpty() || exts.contains(ext)) out.add(f);
+        }
+        Collections.sort(out);
+        return out;
+    }
+
+    // ------------------------------------------------------------------
+    //  Main batch loop (runs on its own thread)
+    // ------------------------------------------------------------------
+    private void runBatch(BatchConfig c, List<File> files) {
+        long start = System.currentTimeMillis();
+        List<String> report = new ArrayList<>();
+        int okCount = 0, warnCount = 0, failCount = 0, skipCount = 0;
+
+        File cellposeRunScript = null;
+        boolean cellposeReady = false;
+        if (c.doCellpose) {
+            try {
+                File checkScript = extractPythonScript("check_and_install_packages.py");
+                cellposeRunScript = extractPythonScript("run_cellpose.py");
+                if (checkScript == null || cellposeRunScript == null) {
+                    IJ.log("Batch: Cellpose scripts not found in the plugin jar. Cellpose step will be skipped.");
+                } else {
+                    IJ.log("Batch: checking Python packages for Cellpose...");
+                    int exit = runPythonProcess(Arrays.asList(c.python, checkScript.getAbsolutePath()));
+                    if (exit == 0) cellposeReady = true;
+                    else IJ.log("Batch: package check failed (exit code " + exit + "). Cellpose step will be skipped.");
+                }
+            } catch (Exception ex) {
+                IJ.log("Batch: could not prepare Cellpose: " + ex.getMessage());
+            }
+        }
+
+        Set<String> usedFolders = new HashSet<>();
+        int n = files.size();
+        for (int i = 0; i < n; i++) {
+            File f = files.get(i);
+            String fileName = f.getName();
+            int dot = fileName.lastIndexOf('.');
+            String base = dot > 0 ? fileName.substring(0, dot) : fileName;
+            String folderName = base.replaceAll("[\\\\/:*?\"<>|]", "_");
+            if (!usedFolders.add(folderName.toLowerCase())) {
+                String ext = dot > 0 ? fileName.substring(dot + 1) : "file";
+                folderName = folderName + "_" + ext;
+                usedFolders.add(folderName.toLowerCase());
+            }
+            File outDir = new File(c.inputDir, folderName);
+
+            IJ.showProgress(i, n);
+            IJ.showStatus("Batch " + (i + 1) + "/" + n + ": " + fileName);
+            IJ.log("Batch [" + (i + 1) + "/" + n + "] " + fileName);
+
+            if (c.skipExisting && outDir.exists()) {
+                IJ.log("   skipped (output folder exists)");
+                report.add("SKIPPED  " + fileName);
+                skipCount++;
+                continue;
+            }
+
+            List<String> problems = new ArrayList<>();
+            try {
+                outDir.mkdirs();
+                processBatchSample(c, f, base, outDir, problems, cellposeReady, cellposeRunScript);
+                if (problems.isEmpty()) {
+                    okCount++;
+                    report.add("OK       " + fileName);
+                } else {
+                    warnCount++;
+                    report.add("WARNINGS " + fileName);
+                    for (String p : problems) report.add("            - " + p);
+                }
+            } catch (Throwable t) {
+                failCount++;
+                outDir.delete();   // removes the folder again if nothing was written into it
+                String msg = t.getMessage() != null ? t.getMessage() : t.toString();
+                IJ.log("   FAILED: " + msg);
+                report.add("FAILED   " + fileName + ": " + msg);
+            }
+            System.gc();
+        }
+        IJ.showProgress(1.0);
+        IJ.showStatus("Batch finished");
+
+        // summary file
+        double minutes = (System.currentTimeMillis() - start) / 60000.0;
+        try (BufferedWriter w = new BufferedWriter(new FileWriter(new File(c.inputDir, "batch_summary.txt")))) {
+            w.write("AR_IA batch processor summary\n");
+            w.write("Folder: " + c.inputDir + "\n");
+            w.write(String.format(Locale.ROOT, "Finished in %.1f minutes\n\n", minutes));
+            w.write(describeBatchConfig(c));
+            w.write("\nResults\n-------\n");
+            for (String line : report) w.write(line + "\n");
+        } catch (IOException ex) {
+            IJ.log("Batch: could not write batch_summary.txt: " + ex.getMessage());
+        }
+
+        final String msg = "Batch finished in " + String.format(Locale.ROOT, "%.1f", minutes) + " min.\n"
+                + okCount + " completed, " + warnCount + " with warnings, "
+                + failCount + " failed, " + skipCount + " skipped.\n"
+                + "A summary was saved as batch_summary.txt in:\n" + c.inputDir;
+        IJ.log(msg);
+        SwingUtilities.invokeLater(() -> {
+            IJ.showMessage("Batch processor", msg);
+            createMainMenu();
+        });
+    }
+
+    private String describeBatchConfig(BatchConfig c) {
+        StringBuilder sb = new StringBuilder("Settings\n--------\n");
+        sb.append("Channel layout: ").append(c.layout).append("\n");
+        sb.append("Channels swapped: ").append(c.swapChannels).append("\n");
+        sb.append("Median filter: ").append(MEDIAN_MODES[c.medianMode]);
+        if (c.medianMode > 0) sb.append(" (radius ").append(medianRadiusSetting).append(")");
+        sb.append("\n");
+        if (c.doAnisotropy || c.doHsb || c.doCellpose || c.doGraphStored || c.doGraphManual) {
+            sb.append("Anisotropy: G-factor ").append(gFactor).append(", bg parallel ").append(bgParallel)
+              .append(", bg perpendicular ").append(bgPerpendicular).append(", F_corr ").append(fCorr).append("\n");
+        }
+        if (c.doRatio || c.doHsb || c.doCellpose || c.doGraphStored || c.doGraphManual) {
+            sb.append("Ratio: bg donor ").append(ratioBgDonor).append(", bg acceptor ").append(ratioBgAcceptor).append("\n");
+        }
+        if (c.doHsb) {
+            sb.append("HSB: hue from ").append(c.hsbSource).append(", hue range ").append(c.hueMin).append(" to ").append(c.hueMax)
+              .append(", colours ").append(c.hueStart).append(" -> ").append(c.hueEnd)
+              .append(c.hueCcw ? " counterclockwise" : " clockwise")
+              .append(", brightness ").append(c.autoBrightness ? "automatic" : (c.brightMin + " to " + c.brightMax))
+              .append(", multiplier ").append(c.brightMult).append(", exponent ").append(c.brightExp)
+              .append(", hue bar ").append(c.hueBar).append("\n");
+        }
+        if (c.doCellpose) {
+            sb.append("Cellpose: image ").append(c.cellposeTemplate).append(", diameter ").append(cellposeDiameterText).append("\n");
+        }
+        if (c.doGraphStored || c.doGraphManual) {
+            sb.append("Graphs: measured image ").append(c.graphTarget).append(", use middle ").append(PERCENTILES[c.percentileIndex]).append("\n");
+            for (int t = 0; t < 2; t++) {
+                if (!NONE.equals(c.thrImg[t]))
+                    sb.append("   threshold ").append(c.thrImg[t]).append(" min=").append(c.thrMin[t]).append(" max=").append(c.thrMax[t]).append("\n");
+            }
+        }
+        if (c.doGraphStored || c.doCellpose) {
+            sb.append("ROI sub-folder: ").append(c.roiSubfolder).append(", frame mode: ").append(ROI_FRAME_MODES[c.roiAllFrames ? 1 : 0]).append("\n");
+        }
+        return sb.toString();
+    }
+
+    // ------------------------------------------------------------------
+    //  Processing of one file
+    // ------------------------------------------------------------------
+    private void processBatchSample(BatchConfig c, File file, String base, File outDir,
+            List<String> problems, boolean cellposeReady, File cellposeRunScript) throws Exception {
+
+        ImagePlus raw = IJ.openImage(file.getAbsolutePath());
+        if (raw == null) throw new Exception("could not open the file");
+        ImagePlus[] ch = splitTwoChannels(raw, c.layout, base);
+        ImagePlus c1 = ch[0];
+        ImagePlus c2 = ch[1];
+        if (c.swapChannels) { ImagePlus tmp = c1; c1 = c2; c2 = tmp; }
+        c1.setTitle(base + "_channel1");
+        c2.setTitle(base + "_channel2");
+
+        Map<String, ImagePlus> prod = new HashMap<>();
+
+        // ---- median filter ----
+        if (c.medianMode > 0) {
+            try {
+                ImagePlus f1 = medianFilterStack(c1, medianRadiusSetting, base + "_median_channel1");
+                ImagePlus f2 = medianFilterStack(c2, medianRadiusSetting, base + "_median_channel2");
+                saveTiff(f1, new File(outDir, base + "_median_channel1.tif"));
+                saveTiff(f2, new File(outDir, base + "_median_channel2.tif"));
+                if (c.medianMode == 2) { c1 = f1; c2 = f2; }
+            } catch (Exception ex) {
+                if (c.medianMode == 2) throw new Exception("median filter failed: " + ex.getMessage());
+                problems.add("median filter: " + ex.getMessage());
+            }
+        }
+        prod.put(P_C1, c1);
+        prod.put(P_C2, c2);
+
+        // ---- anisotropy ----
+        if (c.doAnisotropy) {
+            try {
+                saveTiff(batchProduct(P_ANI, c, prod, base), new File(outDir, base + "_anisotropy.tif"));
+                saveTiff(batchProduct(P_ANI_TOT, c, prod, base), new File(outDir, base + "_total_intensity_anisotropy.tif"));
+            } catch (Exception ex) {
+                problems.add("anisotropy: " + ex.getMessage());
+            }
+        }
+
+        // ---- ratio ----
+        if (c.doRatio) {
+            try {
+                saveTiff(batchProduct(P_RAT, c, prod, base), new File(outDir, base + "_ratio.tif"));
+                saveTiff(batchProduct(P_RAT_TOT, c, prod, base), new File(outDir, base + "_total_intensity_ratio.tif"));
+            } catch (Exception ex) {
+                problems.add("ratio: " + ex.getMessage());
+            }
+        }
+
+        // ---- HSB movie ----
+        if (c.doHsb) {
+            try {
+                boolean fromAni = P_ANI.equals(c.hsbSource);
+                ImagePlus hImp = batchProduct(fromAni ? P_ANI : P_RAT, c, prod, base);
+                ImagePlus bImp = batchProduct(fromAni ? P_ANI_TOT : P_RAT_TOT, c, prod, base);
+                float bMin = c.brightMin, bMax = c.brightMax;
+                if (c.autoBrightness) {
+                    StackStatistics ss = new StackStatistics(bImp);
+                    bMin = (float) ss.min;
+                    bMax = (float) ss.max;
+                    if (bMax == bMin) bMax = bMin + 1f;
+                }
+                ImagePlus hsb = buildHsbMovie(hImp, bImp, base + "_HSB", c.hueMin, c.hueMax, bMin, bMax,
+                        c.brightMult, c.brightExp, c.hueCcw, c.hueStart, c.hueEnd, c.hueBar);
+                saveTiff(hsb, new File(outDir, base + "_HSB.tif"));
+            } catch (Exception ex) {
+                problems.add("HSB movie: " + ex.getMessage());
+            }
+        }
+
+        // ---- Cellpose ----
+        if (c.doCellpose) {
+            if (!cellposeReady) {
+                problems.add("Cellpose: not available (see the Log window)");
+            } else {
+                try {
+                    File cpDir = new File(outDir, c.roiSubfolder);
+                    cpDir.mkdirs();
+                    ImagePlus template = batchProduct(c.cellposeTemplate, c, prod, base);
+                    saveFramesForCellpose(template, cpDir, c.roiAllFrames);
+                    String dirArg = cpDir.getAbsolutePath() + File.separator;
+                    int exit = runPythonProcess(Arrays.asList(c.python, cellposeRunScript.getAbsolutePath(),
+                            "--dir", dirArg, "--diameter", cellposeDiameterText));
+                    if (exit != 0) problems.add("Cellpose exited with code " + exit);
+                } catch (Exception ex) {
+                    problems.add("Cellpose: " + ex.getMessage());
+                }
+            }
+        }
+
+        // ---- graph with stored ROI's ----
+        if (c.doGraphStored) {
+            try {
+                graphStoredRois(c, prod, base, outDir);
+            } catch (Exception ex) {
+                problems.add("graph (stored ROI's): " + ex.getMessage());
+            }
+        }
+
+        // ---- graph with manual ROI ----
+        if (c.doGraphManual) {
+            try {
+                graphManualRoi(c, prod, base, outDir);
+            } catch (Exception ex) {
+                problems.add("graph (manual ROI): " + ex.getMessage());
+            }
+        }
+
+        for (String p : problems) IJ.log("   warning: " + p);
+        IJ.log("   done");
+    }
+
+    private ImagePlus[] splitTwoChannels(ImagePlus imp, String layout, String base) throws Exception {
+        if (LAYOUT_HYPER.equals(layout)) {
+            if (imp.getNChannels() != 2) {
+                throw new Exception("expected 2 channels (C=2) but the file has " + imp.getNChannels()
+                    + " channel(s) - choose another channel layout in the batch dialog");
+            }
+            ImagePlus[] ch = ChannelSplitter.split(imp);
+            if (ch == null || ch.length != 2) throw new Exception("could not split the channels");
+            return ch;
+        }
+        ImageStack st = imp.getStack();
+        int n = st.getSize();
+        if (n < 2 || n % 2 != 0) {
+            throw new Exception("the file has " + n + " slice(s); an even number is needed for this channel layout");
+        }
+        ImageStack s1 = new ImageStack(imp.getWidth(), imp.getHeight());
+        ImageStack s2 = new ImageStack(imp.getWidth(), imp.getHeight());
+        for (int i = 1; i <= n; i++) {
+            boolean first = LAYOUT_INTERLEAVED.equals(layout) ? (i % 2 == 1) : (i <= n / 2);
+            (first ? s1 : s2).addSlice(st.getSliceLabel(i), st.getProcessor(i));
+        }
+        return new ImagePlus[] { new ImagePlus(base + "_channel1", s1), new ImagePlus(base + "_channel2", s2) };
+    }
+
+    private ImagePlus medianFilterStack(ImagePlus imp, double radius, String title) {
+        final int w = imp.getWidth(), h = imp.getHeight(), n = imp.getStackSize();
+        final ImageStack src = imp.getStack();
+        final ConcurrentHashMap<Integer, ImageProcessor> map = new ConcurrentHashMap<>();
+        IntStream.rangeClosed(1, n).parallel().forEach(i -> {
+            FloatProcessor fp = (FloatProcessor) src.getProcessor(i).convertToFloatProcessor().duplicate();
+            new RankFilters().rank(fp, radius, RankFilters.MEDIAN);
+            map.put(i, fp);
+        });
+        ImageStack out = new ImageStack(w, h);
+        for (int i = 1; i <= n; i++) out.addSlice(map.get(i));
+        return new ImagePlus(title, out);
+    }
+
+    /** Returns a derived image, computing it (and its partner) on first use. */
+    private ImagePlus batchProduct(String name, BatchConfig c, Map<String, ImagePlus> prod, String base) throws Exception {
+        ImagePlus p = prod.get(name);
+        if (p != null) return p;
+        ImagePlus c1 = prod.get(P_C1);
+        ImagePlus c2 = prod.get(P_C2);
+        if (P_ANI.equals(name) || P_ANI_TOT.equals(name)) {
+            ImagePlus[] r = computeAnisotropyImages(c1, c2, base);
+            prod.put(P_ANI, r[0]);
+            prod.put(P_ANI_TOT, r[1]);
+        } else if (P_RAT.equals(name) || P_RAT_TOT.equals(name)) {
+            ImagePlus[] r = computeRatioImages(c1, c2, base);
+            prod.put(P_RAT, r[0]);
+            prod.put(P_RAT_TOT, r[1]);
+        } else {
+            throw new Exception("unknown image '" + name + "'");
+        }
+        return prod.get(name);
+    }
+
+    private void checkSameSize(ImagePlus a, ImagePlus b) throws Exception {
+        if (a.getWidth() != b.getWidth() || a.getHeight() != b.getHeight() || a.getStackSize() != b.getStackSize()) {
+            throw new Exception("the two channels have different dimensions or number of frames");
+        }
+    }
+
+    private ImagePlus[] computeAnisotropyImages(ImagePlus par, ImagePlus perp, String base) throws Exception {
+        checkSameSize(par, perp);
+        final int w = par.getWidth(), h = par.getHeight(), n = par.getStackSize();
+        final float g = (float) gFactor;
+        final double gd = gFactor, fc = fCorr;
+        final float bgPar = (float) bgParallel, bgPerp = (float) bgPerpendicular;
+        final ImageStack sPar = par.getStack(), sPerp = perp.getStack();
+        final ConcurrentHashMap<Integer, FloatProcessor> aniMap = new ConcurrentHashMap<>();
+        final ConcurrentHashMap<Integer, FloatProcessor> denMap = new ConcurrentHashMap<>();
+        IntStream.rangeClosed(1, n).parallel().forEach(f -> {
+            ImageProcessor ipPar = sPar.getProcessor(f);
+            ImageProcessor ipPerp = sPerp.getProcessor(f);
+            FloatProcessor ani = new FloatProcessor(w, h);
+            FloatProcessor den = new FloatProcessor(w, h);
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    float iPar = ipPar.getf(x, y) - bgPar;
+                    float iPerp = ipPerp.getf(x, y) - bgPerp;
+                    float denominator = iPar + 2 * g * iPerp;
+                    den.setf(x, y, denominator);
+                    float rnul = (denominator != 0) ? (iPar - (float) (gd * iPerp)) / denominator : 0;
+                    ani.setf(x, y, (float) (rnul * fc));
+                }
+            }
+            aniMap.put(f, ani);
+            denMap.put(f, den);
+        });
+        ImageStack aniStack = new ImageStack(w, h);
+        ImageStack denStack = new ImageStack(w, h);
+        for (int f = 1; f <= n; f++) { aniStack.addSlice(aniMap.get(f)); denStack.addSlice(denMap.get(f)); }
+        return new ImagePlus[] {
+            new ImagePlus(base + "_Anisotropy", aniStack),
+            new ImagePlus(base + "_total_intensity_anisotropy", denStack) };
+    }
+
+    private ImagePlus[] computeRatioImages(ImagePlus donor, ImagePlus acceptor, String base) throws Exception {
+        checkSameSize(donor, acceptor);
+        final int w = donor.getWidth(), h = donor.getHeight(), n = donor.getStackSize();
+        final float bgD = (float) ratioBgDonor, bgA = (float) ratioBgAcceptor;
+        final ImageStack sD = donor.getStack(), sA = acceptor.getStack();
+        final ConcurrentHashMap<Integer, FloatProcessor> ratioMap = new ConcurrentHashMap<>();
+        final ConcurrentHashMap<Integer, FloatProcessor> totMap = new ConcurrentHashMap<>();
+        IntStream.rangeClosed(1, n).parallel().forEach(f -> {
+            ImageProcessor ipD = sD.getProcessor(f);
+            ImageProcessor ipA = sA.getProcessor(f);
+            FloatProcessor ratio = new FloatProcessor(w, h);
+            FloatProcessor tot = new FloatProcessor(w, h);
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    float iD = ipD.getf(x, y) - bgD;
+                    float iA = ipA.getf(x, y) - bgA;
+                    tot.setf(x, y, iD + iA);
+                    ratio.setf(x, y, (iD != 0) ? iA / iD : 0);
+                }
+            }
+            ratioMap.put(f, ratio);
+            totMap.put(f, tot);
+        });
+        ImageStack ratioStack = new ImageStack(w, h);
+        ImageStack totStack = new ImageStack(w, h);
+        for (int f = 1; f <= n; f++) { ratioStack.addSlice(ratioMap.get(f)); totStack.addSlice(totMap.get(f)); }
+        return new ImagePlus[] {
+            new ImagePlus(base + "_ratio", ratioStack),
+            new ImagePlus(base + "_total_intensity_ratio", totStack) };
+    }
+
+    /** Same colour mapping as the interactive Hue-Brightness movie, without any window. */
+    private ImagePlus buildHsbMovie(ImagePlus hImp, ImagePlus bImp, String title,
+            final float hMin, final float hMax, final float bMin, final float bMax,
+            final float mult, final float exp, final boolean ccw,
+            final float hStart, final float hEnd, final boolean withBar) throws Exception {
+        checkSameSize(hImp, bImp);
+        final int width = hImp.getWidth(), height = hImp.getHeight();
+        final int frames = hImp.getStackSize();
+        final int barHeight = height / 7;
+        final float hueRange = hMax - hMin;
+        final float bRange = bMax - bMin;
+        final ImageStack hStack = hImp.getStack(), bStack = bImp.getStack();
+        final ConcurrentHashMap<Integer, ColorProcessor> frameMap = new ConcurrentHashMap<>();
+
+        IntStream.rangeClosed(1, frames).parallel().forEach(i -> {
+            FloatProcessor hFp = hStack.getProcessor(i).convertToFloatProcessor();
+            FloatProcessor bFp = bStack.getProcessor(i).convertToFloatProcessor();
+            float[] huePixels = Arrays.copyOf((float[]) hFp.getPixels(), width * height);
+            float[] brightPixels = Arrays.copyOf((float[]) bFp.getPixels(), width * height);
+            byte[] satBytes = new byte[width * height];
+            Arrays.fill(satBytes, (byte) Math.min(255, Math.max(0, sValue)));
+
+            for (int index = 0; index < huePixels.length; index++) {
+                float brightnessValue = (brightPixels[index] - bMin) / bRange;
+                float hueValue = (huePixels[index] - hMin) / hueRange;
+                if (hueValue < 0f) hueValue = 0f;
+                else if (hueValue > 1f) hueValue = 1f;
+                hueValue = ccw ? adjustHueCounterClockwise(hueValue, hStart, hEnd)
+                               : adjustHueClockwise(hueValue, hStart, hEnd);
+                huePixels[index] = hueValue * 255;
+                brightPixels[index] = (float) Math.pow(brightnessValue * 255 * mult, exp);
+            }
+
+            ColorProcessor rgb = new ColorProcessor(width, height);
+            rgb.setHSB(convertToByteArray(huePixels), satBytes, convertToByteArray(brightPixels));
+
+            if (withBar) {
+                BufferedImage bar = createHueBar(width, barHeight, ccw, hStart, hEnd, hMin, hMax);
+                ColorProcessor combined = new ColorProcessor(width, height + barHeight);
+                combined.insert(rgb, 0, 0);
+                combined.insert(new ColorProcessor(bar), 0, height);
+                frameMap.put(i, combined);
+            } else {
+                frameMap.put(i, rgb);
+            }
+        });
+
+        ImageStack out = new ImageStack(width, withBar ? height + barHeight : height);
+        for (int i = 1; i <= frames; i++) out.addSlice(frameMap.get(i));
+        return new ImagePlus(title, out);
+    }
+
+    // ------------------------------------------------------------------
+    //  Cellpose helpers
+    // ------------------------------------------------------------------
+    private void saveFramesForCellpose(ImagePlus template, File dir, boolean allFrames) {
+        int n = allFrames ? template.getStackSize() : 1;
+        ImageStack st = template.getStack();
+        for (int i = 1; i <= n; i++) {
+            ImagePlus frame = new ImagePlus("Frame " + i, st.getProcessor(i).duplicate());
+            new FileSaver(frame).saveAsTiff(new File(dir, "frame_" + String.format("%04d", i) + ".tif").getAbsolutePath());
+        }
+    }
+
+    /** Runs an external process, forwards its output to the Log window, returns the exit code. */
+    private int runPythonProcess(List<String> command) throws IOException, InterruptedException {
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.redirectErrorStream(true);
+        Process proc = pb.start();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) IJ.log("      " + line);
+        }
+        return proc.waitFor();
+    }
+
+    // ------------------------------------------------------------------
+    //  Graphs
+    // ------------------------------------------------------------------
+    private double percentileValue(BatchConfig c) {
+        switch (c.percentileIndex) {
+            case 1: return 0.99;
+            case 2: return 0.95;
+            case 3: return 0.80;
+            default: return -1;
+        }
+    }
+
+    private List<ImagePlus> batchThresholdImages(BatchConfig c, Map<String, ImagePlus> prod, String base,
+            double[] mins, double[] maxs) throws Exception {
+        List<ImagePlus> list = new ArrayList<>();
+        List<Double> minList = new ArrayList<>();
+        List<Double> maxList = new ArrayList<>();
+        if (percentileValue(c) <= 0) {
+            for (int t = 0; t < 2; t++) {
+                if (NONE.equals(c.thrImg[t])) continue;
+                list.add(batchProduct(c.thrImg[t], c, prod, base));
+                minList.add(c.thrMin[t].isEmpty() ? -Double.MAX_VALUE : Double.parseDouble(c.thrMin[t]));
+                maxList.add(c.thrMax[t].isEmpty() ? Double.MAX_VALUE : Double.parseDouble(c.thrMax[t]));
+            }
+        }
+        for (int i = 0; i < list.size(); i++) { mins[i] = minList.get(i); maxs[i] = maxList.get(i); }
+        return list;
+    }
+
+    private static String fileTag(String name) {
+        return name.replaceAll("[^A-Za-z0-9]+", "_").replaceAll("^_+|_+$", "");
+    }
+
+    private void graphStoredRois(BatchConfig c, Map<String, ImagePlus> prod, String base, File outDir) throws Exception {
+        File roiDir = new File(outDir, c.roiSubfolder);
+        File[] zips = roiDir.listFiles((d, name) -> name.toLowerCase().endsWith(".zip"));
+        if (zips == null || zips.length == 0) throw new Exception("no ROI zip files found in " + roiDir.getName());
+        Arrays.sort(zips);
+
+        final ImagePlus value = batchProduct(c.graphTarget, c, prod, base);
+        final int frames = value.getStackSize();
+        List<Roi[]> sets = new ArrayList<>();
+        if (c.roiAllFrames) {
+            if (zips.length != frames) {
+                throw new Exception("number of ROI zip files (" + zips.length + ") does not match the number of frames (" + frames + ")");
+            }
+            for (File z : zips) sets.add(readRoiZip(z));
+        } else {
+            sets.add(readRoiZip(zips[0]));
+        }
+
+        double[] mins = new double[2], maxs = new double[2];
+        List<ImagePlus> thr = batchThresholdImages(c, prod, base, mins, maxs);
+
+        int nRois = 0;
+        for (Roi[] s : sets) nRois = Math.max(nRois, s.length);
+        if (nRois == 0) throw new Exception("the ROI zip file(s) contain no ROI's");
+        double[][] series = new double[nRois][frames];
+        for (double[] row : series) Arrays.fill(row, Double.NaN);
+
+        for (int f = 1; f <= frames; f++) {
+            Roi[] set = c.roiAllFrames ? sets.get(f - 1) : sets.get(0);
+            ImageProcessor vip = value.getStack().getProcessor(f);
+            List<ImageProcessor> tips = new ArrayList<>();
+            for (ImagePlus t : thr) tips.add(t.getStack().getProcessor(Math.min(f, t.getStackSize())));
+            for (int j = 0; j < set.length; j++) {
+                if (set[j] == null) continue;
+                series[j][f - 1] = measureRoi(vip, set[j], tips, mins, maxs, percentileValue(c));
+            }
+        }
+
+        String[] labels = new String[nRois];
+        for (int j = 0; j < nRois; j++) labels[j] = "ROI " + (j + 1);
+        String tag = "_graph_" + fileTag(c.graphTarget) + "_stored_ROIs";
+        writeSeriesCsv(new File(outDir, base + tag + ".csv"), labels, series, frames);
+        saveSeriesPlot(new File(outDir, base + tag + ".tif"), base + " " + c.graphTarget, labels, series, frames);
+    }
+
+    private void graphManualRoi(BatchConfig c, Map<String, ImagePlus> prod, String base, File outDir) throws Exception {
+        if (c.manualRoi == null) throw new Exception("no manual ROI available");
+        final ImagePlus value = batchProduct(c.graphTarget, c, prod, base);
+        final int frames = value.getStackSize();
+        Roi roi = (Roi) c.manualRoi.clone();
+        Rectangle rb = roi.getBounds();
+        if (rb.x < 0 || rb.y < 0 || rb.x + rb.width > value.getWidth() || rb.y + rb.height > value.getHeight()) {
+            IJ.log("   note: the manual ROI extends outside this image; only the overlapping part is measured");
+        }
+
+        double[] mins = new double[2], maxs = new double[2];
+        List<ImagePlus> thr = batchThresholdImages(c, prod, base, mins, maxs);
+
+        double[][] series = new double[1][frames];
+        for (int f = 1; f <= frames; f++) {
+            ImageProcessor vip = value.getStack().getProcessor(f);
+            List<ImageProcessor> tips = new ArrayList<>();
+            for (ImagePlus t : thr) tips.add(t.getStack().getProcessor(Math.min(f, t.getStackSize())));
+            series[0][f - 1] = measureRoi(vip, roi, tips, mins, maxs, percentileValue(c));
+        }
+
+        String[] labels = { "manual ROI" };
+        String tag = "_graph_" + fileTag(c.graphTarget) + "_manual_ROI";
+        writeSeriesCsv(new File(outDir, base + tag + ".csv"), labels, series, frames);
+        saveSeriesPlot(new File(outDir, base + tag + ".tif"), base + " " + c.graphTarget, labels, series, frames);
+        RoiEncoder.save(roi, new File(outDir, base + "_manual_ROI.roi").getAbsolutePath());
+    }
+
+    /** Average value inside the ROI for one frame (percentile trimming or threshold images as in the interactive version). */
+    private double measureRoi(ImageProcessor value, Roi roi, List<ImageProcessor> thr,
+            double[] mins, double[] maxs, double percentile) {
+        Rectangle b = roi.getBounds();
+        ImageProcessor mask = roi.getMask();
+        int x0 = Math.max(0, b.x), x1 = Math.min(value.getWidth(), b.x + b.width);
+        int y0 = Math.max(0, b.y), y1 = Math.min(value.getHeight(), b.y + b.height);
+
+        double lo = -Double.MAX_VALUE, hi = Double.MAX_VALUE;
+        if (percentile > 0) {
+            ArrayList<Double> vals = new ArrayList<>();
+            for (int y = y0; y < y1; y++) {
+                for (int x = x0; x < x1; x++) {
+                    if (mask != null && mask.get(x - b.x, y - b.y) == 0) continue;
+                    vals.add((double) value.getPixelValue(x, y));
+                }
+            }
+            if (!vals.isEmpty()) {
+                Collections.sort(vals);
+                int total = vals.size();
+                double trim = (1.0 - percentile) / 2.0;
+                int l = (int) Math.floor(trim * total);
+                int h = Math.min((int) Math.ceil((1.0 - trim) * total) - 1, total - 1);
+                lo = vals.get(l);
+                hi = vals.get(Math.max(l, h));
+            }
+        }
+
+        double sum = 0;
+        int count = 0;
+        for (int y = y0; y < y1; y++) {
+            for (int x = x0; x < x1; x++) {
+                if (mask != null && mask.get(x - b.x, y - b.y) == 0) continue;
+                double v = value.getPixelValue(x, y);
+                boolean passes = true;
+                if (percentile > 0) {
+                    passes = (v >= lo && v <= hi);
+                } else {
+                    for (int t = 0; t < thr.size(); t++) {
+                        double tv = thr.get(t).getPixelValue(x, y);
+                        if (tv < mins[t] || tv > maxs[t]) { passes = false; break; }
+                    }
+                }
+                if (passes) { sum += v; count++; }
+            }
+        }
+        return count > 0 ? sum / count : 0.0;
+    }
+
+    private Roi[] readRoiZip(File zip) throws IOException {
+        List<Roi> rois = new ArrayList<>();
+        try (ZipInputStream zin = new ZipInputStream(new java.io.FileInputStream(zip))) {
+            ZipEntry entry;
+            while ((entry = zin.getNextEntry()) != null) {
+                String name = entry.getName();
+                if (!name.toLowerCase().endsWith(".roi")) continue;
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                byte[] buf = new byte[4096];
+                int len;
+                while ((len = zin.read(buf)) > 0) bos.write(buf, 0, len);
+                Roi roi = new RoiDecoder(bos.toByteArray(), name).getRoi();
+                if (roi != null) rois.add(roi);
+            }
+        }
+        return rois.toArray(new Roi[0]);
+    }
+
+    private void writeSeriesCsv(File file, String[] labels, double[][] series, int frames) throws IOException {
+        try (BufferedWriter w = new BufferedWriter(new FileWriter(file))) {
+            StringBuilder header = new StringBuilder("frame");
+            for (String l : labels) header.append(',').append(l);
+            w.write(header.toString());
+            w.newLine();
+            for (int f = 0; f < frames; f++) {
+                StringBuilder row = new StringBuilder().append(f + 1);
+                for (double[] s : series) {
+                    row.append(',');
+                    if (!Double.isNaN(s[f])) row.append(s[f]);
+                }
+                w.write(row.toString());
+                w.newLine();
+            }
+        }
+    }
+
+    private void saveSeriesPlot(File file, String title, String[] labels, double[][] series, int frames) {
+        double[] x = new double[frames];
+        for (int i = 0; i < frames; i++) x[i] = i + 1;
+        Plot plot = new Plot(title, "Frame", "Average pixel value");
+        Color[] palette = { Color.BLUE, Color.RED, new Color(0, 150, 0), Color.MAGENTA,
+                            Color.ORANGE, Color.CYAN.darker(), Color.DARK_GRAY, Color.PINK.darker() };
+        for (int k = 0; k < series.length; k++) {
+            plot.setColor(palette[k % palette.length]);
+            plot.addPoints(x, series[k], Plot.LINE);
+        }
+        plot.setLimitsToFit(false);
+        ImagePlus plotImp = plot.getImagePlus();
+        new FileSaver(plotImp).saveAsTiff(file.getAbsolutePath());
+    }
+
+    private void saveTiff(ImagePlus imp, File file) {
+        FileSaver fs = new FileSaver(imp);
+        if (imp.getStackSize() > 1) fs.saveAsTiffStack(file.getAbsolutePath());
+        else fs.saveAsTiff(file.getAbsolutePath());
+    }
 
     public static void main(String[] args) {
         // Launch ImageJ
