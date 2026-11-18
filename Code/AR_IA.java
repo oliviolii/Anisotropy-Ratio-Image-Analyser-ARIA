@@ -433,6 +433,19 @@ public class AR_IA implements PlugIn {
        
         });
         
+        // Create "overview of all batch graphs" button
+        JButton overviewButton = new JButton("Overview of all graphs in a batch-analysed folder");
+        overviewButton.setPreferredSize(new Dimension(200, 40));
+        overviewButton.setMinimumSize(new Dimension(200, 40));
+        overviewButton.setMaximumSize(new Dimension(400, 40));
+        overviewButton.addActionListener(new ActionListener() {
+            public void actionPerformed(ActionEvent e) {
+                sampleName = sampleNameField.getText().trim();
+                frame.dispose();
+                batchGraphOverview();
+            }
+        });
+
         // Create "Track Roi with maths" button
         JButton RoiTrackerButton = new JButton("Track one ROI with math instead of AI");
         RoiTrackerButton.setPreferredSize(new Dimension(200, 40)); // Set preferred button size
@@ -525,6 +538,9 @@ public class AR_IA implements PlugIn {
         
 
         buttonPanel.add(batchButton);
+        buttonPanel.add(Box.createRigidArea(new Dimension(0, 10)));
+
+        buttonPanel.add(overviewButton);
         buttonPanel.add(Box.createRigidArea(new Dimension(0, 10)));
 
         buttonPanel.add(SaveAllButton);
@@ -837,6 +853,122 @@ public class AR_IA implements PlugIn {
     	createMainMenu();
     }
     
+    // =====================================================================
+    //  OVERVIEW OF ALL GRAPHS OF A BATCH-ANALYSED FOLDER
+    //  Looks in every sub-folder of the chosen folder for the graph csv files
+    //  written by the batch processor (<name>_graph_<target>_stored_ROIs.csv
+    //  and <name>_graph_<target>_manual_ROI.csv) and merges them. One overview
+    //  csv is written per graph type, with one column per sample (and ROI).
+    // =====================================================================
+    private void batchGraphOverview() {
+        DirectoryChooser dc = new DirectoryChooser("Select the batch-analysed folder (the one containing the sample sub-folders)");
+        String dir = dc.getDirectory();
+        if (dir == null) { createMainMenu(); return; }
+        File root = new File(dir);
+
+        List<File> csvs = new ArrayList<>();
+        collectGraphCsvs(root, root, csvs);
+        if (csvs.isEmpty()) {
+            IJ.showMessage("Graph overview", "No graph csv files (*_graph_*.csv) found in the sub-folders of:\n" + dir);
+            createMainMenu();
+            return;
+        }
+        Collections.sort(csvs);
+
+        // group by graph type = the part of the file name starting at "_graph_"
+        Map<String, List<File>> groups = new java.util.TreeMap<>();
+        for (File f : csvs) {
+            String n = f.getName();
+            String key = n.substring(n.indexOf("_graph_") + 1, n.length() - 4);
+            groups.computeIfAbsent(key, k -> new ArrayList<>()).add(f);
+        }
+
+        int written = 0;
+        StringBuilder msg = new StringBuilder();
+        for (Map.Entry<String, List<File>> g : groups.entrySet()) {
+            final String key = g.getKey();
+            List<String> headers = new ArrayList<>();
+            List<double[]> cols = new ArrayList<>();
+            int maxLen = 0;
+            for (File f : g.getValue()) {
+                String n = f.getName();
+                String sample = n.substring(0, n.indexOf("_graph_"));
+                try (BufferedReader r = new BufferedReader(new java.io.FileReader(f))) {
+                    String head = r.readLine();
+                    if (head == null) continue;
+                    String[] h = head.split(",", -1);
+                    int nSeries = h.length - 1;
+                    List<double[]> rows = new ArrayList<>();
+                    String line;
+                    while ((line = r.readLine()) != null) {
+                        if (line.trim().isEmpty()) continue;
+                        String[] parts = line.split(",", -1);
+                        double[] row = new double[nSeries];
+                        for (int k = 0; k < nSeries; k++) {
+                            String v = k + 1 < parts.length ? parts[k + 1].trim() : "";
+                            row[k] = v.isEmpty() ? Double.NaN : Double.parseDouble(v);
+                        }
+                        rows.add(row);
+                    }
+                    for (int k = 0; k < nSeries; k++) {
+                        double[] col = new double[rows.size()];
+                        for (int i = 0; i < col.length; i++) col[i] = rows.get(i)[k];
+                        cols.add(col);
+                        headers.add(sample + (nSeries > 1 || !h[k + 1].equals("manual ROI") ? " | " + h[k + 1] : ""));
+                        maxLen = Math.max(maxLen, col.length);
+                    }
+                } catch (Exception ex) {
+                    IJ.log("Overview: could not read " + f.getAbsolutePath() + ": " + ex.getMessage());
+                }
+            }
+            if (cols.isEmpty()) continue;
+
+            File out = new File(root, "overview_" + key + ".csv");
+            try (BufferedWriter w = new BufferedWriter(new FileWriter(out))) {
+                StringBuilder hd = new StringBuilder("frame");
+                for (String h : headers) hd.append(',').append(csvEscape(h));
+                w.write(hd.toString());
+                w.newLine();
+                for (int i = 0; i < maxLen; i++) {
+                    StringBuilder row = new StringBuilder().append(i + 1);
+                    for (double[] col : cols) {
+                        row.append(',');
+                        if (i < col.length && !Double.isNaN(col[i])) row.append(col[i]);
+                    }
+                    w.write(row.toString());
+                    w.newLine();
+                }
+                written++;
+                msg.append(out.getName()).append("  (").append(cols.size()).append(" columns, ")
+                   .append(maxLen).append(" frames)\n");
+                IJ.log("Overview: wrote " + out.getAbsolutePath());
+            } catch (IOException ex) {
+                IJ.log("Overview: could not write " + out.getName() + ": " + ex.getMessage());
+            }
+        }
+
+        if (written == 0) IJ.showMessage("Graph overview", "No graph data could be read.");
+        else IJ.showMessage("Graph overview", "Saved " + written + " overview file(s) in:\n" + dir + "\n\n" + msg);
+        createMainMenu();
+    }
+
+    private static void collectGraphCsvs(File root, File dir, List<File> out) {
+        File[] all = dir.listFiles();
+        if (all == null) return;
+        for (File f : all) {
+            if (f.isDirectory()) {
+                collectGraphCsvs(root, f, out);
+            } else if (!dir.equals(root)) {   // only files inside sample sub-folders
+                String n = f.getName();
+                if (n.toLowerCase().endsWith(".csv") && n.contains("_graph_")) out.add(f);
+            }
+        }
+    }
+
+    private static String csvEscape(String s) {
+        return (s.contains(",") || s.contains("\"")) ? "\"" + s.replace("\"", "\"\"") + "\"" : s;
+    }
+
     private void RoiTracker() {
     	   int[] windowIDs = WindowManager.getIDList();
 
@@ -5025,5 +5157,6 @@ public class AR_IA implements PlugIn {
         IJ.runPlugIn(AR_IA.class.getName(), "");
     }
 } 
+
 
 
